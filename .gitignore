@@ -1,0 +1,44 @@
+# Unity generated directories
+/Library/
+/Temp/
+/Logs/
+/obj/
+/Build/
+/Builds/
+/MemoryCaptures/
+
+# User settings (可选，根据团队需求决定是否保留)
+/UserSettings/
+
+# Visual Studio cache
+.vs/
+
+# JetBrains IDE cache
+.idea/
+*.DotSettings*
+
+# Auto-generated project files
+*.csproj
+*.sln
+
+# Unity crash reports
+sysinfo.txt
+crashlytics-build.properties
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Gradle cache (for Android builds)
+.gradle/
+
+# Asset import overrides
+AssetImportOverrides/
+
+# Claude Code local settings
+.claude/
