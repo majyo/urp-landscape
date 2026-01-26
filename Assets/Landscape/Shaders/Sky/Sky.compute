@@ -1,0 +1,235 @@
+#pragma kernel ComputeTransmittance
+#pragma kernel ComputeMultiScattering
+#pragma kernel ComputeSkyView
+
+#define NUM_THREADS 8
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Assets/Landscape/ShaderLibrary/Sky/MathHelpers.hlsl"
+#include "Assets/Landscape/ShaderLibrary/Sky/Scatterings.hlsl"
+
+RWTexture2D<float4> _TransmittanceLUT;
+RWTexture2D<float4> _MultiScatteringLUT;
+RWTexture2D<float4> _SkyViewLUT;
+
+TEXTURE2D(_TransmittanceReadonlyLUT);
+TEXTURE2D(_MultiScatteringReadonlyLUT);
+
+SAMPLER(linear_clamp_sampler);
+
+float2 IdToUv(uint2 id, float2 dim)
+{
+	return (float2(id.x, id.y) + 0.5) / dim;
+}
+
+float3 TransmitToAtmosphere(in AtmosphereData atmosphere, float3 p, float3 dir)
+{
+    Ray ray;
+    ray.origin = p;
+    ray.direction = dir;
+	
+    float atmosphereRadius = atmosphere.planet_radius + atmosphere.atmosphere_height;
+    float distance = RayHitSphereClosest(ray, float3(0.0, 0.0, 0.0), atmosphereRadius);
+
+    if (distance < 0.0)
+    {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    float3 p0 = p + distance * dir;
+
+    return Transmit(atmosphere, p, p0);
+}
+
+float3 MultiScattering(in AtmosphereData atmosphereData, float3 samplePoint, float3 lightDir,
+    TEXTURE2D(lut), SAMPLER(lut_sampler))
+{
+	float phaseFactor = 1.0 / (4.0 * PI);
+	float solidAnglerPerSample = 4.0 * PI / (float) NUM_DIRECTION;
+
+	float3 g2 = 0;
+	float3 fMs = 0;
+
+	for (int i = 0; i < NUM_DIRECTION; ++i)
+	{
+		float3 viewDir = RANDOM_SPHERE_SAMPLES[i];
+		Ray viewRay;
+		viewRay.origin = samplePoint;
+		viewRay.direction = viewDir;
+		float distanceToAtmosphere = RayHitSphereClosest(viewRay,
+			float3(0.0f, 0.0f, 0.0f), atmosphereData.planet_radius + atmosphereData.atmosphere_height);
+		float distanceToPlanet = RayHitSphereClosest(viewRay,
+			float3(0.0f, 0.0f, 0.0f), atmosphereData.planet_radius);
+		float distance =
+			distanceToPlanet > 0.0 ? min(distanceToAtmosphere, distanceToPlanet) : distanceToAtmosphere;
+		float ds = distance / (float) NUM_SAMPLE;
+		float3 p = samplePoint + (viewDir * ds) * 0.5;
+		float3 opticalDepth = (float3) 0;
+        
+		for (int j = 0; j < NUM_SAMPLE; ++j)
+		{
+			float h = length(p) - atmosphereData.planet_radius;
+			float3 sigmaS = RayleighCoefficient(atmosphereData, h) + MieCoefficient(atmosphereData, h);
+			float3 sigmaA = OzoneAbsorption(atmosphereData, h) + MieAbsorption(atmosphereData, h);
+			float3 sigmaT = sigmaS + sigmaA;
+			opticalDepth += sigmaT * ds;
+
+			float3 t1 = TransmitToAtmosphereLut(atmosphereData, p, lightDir, lut, lut_sampler);
+			float3 s = Scattering(atmosphereData, p, lightDir, viewDir);
+			float3 t2 = exp(-opticalDepth);
+
+			g2 += t1 * s * t2 * phaseFactor * ds * 1.0;
+			fMs += t2 * sigmaS * phaseFactor * ds;
+
+			p += viewDir * ds;
+		}
+	}
+
+	g2 *= solidAnglerPerSample;
+	fMs *= solidAnglerPerSample;
+
+	return g2 * (1.0 / (1.0 - fMs));
+}
+
+float3 GetSkyColor(in AtmosphereData atmosphere, float3 viewPos, float3 viewDir, float3 lightDir, float maxDistance)
+{
+	float3 color = float3(0.0, 0.0, 0.0);
+	
+	Ray ray;
+	ray.origin = viewPos;
+	ray.direction = viewDir;
+	
+	float3 planetCenter = float3(0.0, 0.0, 0.0);
+	float atmosphereRadius = atmosphere.planet_radius + atmosphere.atmosphere_height;
+
+	float distanceAtmosphere = RayHitSphereClosest(ray, planetCenter, atmosphereRadius);
+	float distancePlanet = RayHitSphereClosest(ray, planetCenter, atmosphere.planet_radius);
+	float distance = distanceAtmosphere;
+
+	if (distanceAtmosphere < 0.0)
+	{
+		return color;
+	}
+
+	if (distancePlanet > 0.0)
+	{
+		distance = min(distanceAtmosphere, distancePlanet);
+	}
+
+	if (maxDistance > 0.0)
+	{
+		distance = min(distance, maxDistance);
+	}
+
+	const float ds = distance / float(NUM_SAMPLE_LIT_PATH);
+	float3 p = viewPos + (viewDir * ds) * 0.5;
+	const float3 sunLuminance = atmosphere.sun_light_color * atmosphere.sun_light_intensity;
+	float3 opticalDepth = float3(0.0, 0.0, 0.0);
+
+	float3 groundColor = float3(0.0, 0.0, 0.0);
+
+	if (distancePlanet > 0.0)
+	{
+		const float3 groundPos = viewPos + viewDir * distancePlanet;
+		const float3 groundNormal = float3(0.0, 1.0, 0.0);
+		const float3 sunLuminanceToGround = sunLuminance * TransmitToAtmosphereLut(atmosphere, groundPos, lightDir, _TransmittanceReadonlyLUT, linear_clamp_sampler);
+		groundColor = atmosphere.ground_tint * INV_PI * sunLuminanceToGround * saturate(dot(groundNormal, lightDir)) * 0.05;
+	}
+
+	for (int i = 0; i < NUM_SAMPLE_LIT_PATH; i++)
+	{
+		float h = length(p) - atmosphere.planet_radius;
+		float3 sigmaS = RayleighCoefficient(atmosphere, h) + MieCoefficient(atmosphere, h);
+		float3 sigmaA = OzoneAbsorption(atmosphere, h) + MieAbsorption(atmosphere, h);
+		float3 sigmaT = sigmaS + sigmaA;
+		opticalDepth += sigmaT * ds;
+		
+		float3 t1 = TransmitToAtmosphereLut(atmosphere, p, lightDir, _TransmittanceReadonlyLUT, linear_clamp_sampler);
+		float3 s = Scattering(atmosphere, p, lightDir, viewDir);
+		float3 t2 = exp(-opticalDepth);
+		
+		float3 inScattering = t1 * s * t2 * ds * sunLuminance;
+		color += inScattering;
+
+		float3 multiScattering = SampleMultiScatteringLut(atmosphere, p, lightDir, _MultiScatteringReadonlyLUT, linear_clamp_sampler);
+		color += multiScattering * t2 * ds * sunLuminance;
+
+		// color += groundColor * t2 * ds;
+
+		p += viewDir * ds;
+	}
+
+	color += groundColor;
+
+	return color;
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, 1)]
+void ComputeTransmittance(uint3 id : SV_DispatchThreadID)
+{
+	float dimX;
+	float dimY;
+	_TransmittanceLUT.GetDimensions(dimX, dimY);
+	
+	AtmosphereData atmosphereData = GetAtmosphereData();
+	float2 uv = (float2(id.x, id.y) + 0.5) / float2(dimX, dimY);
+
+	float innerRadius = atmosphereData.planet_radius;
+	float outerRadius = atmosphereData.planet_radius + atmosphereData.atmosphere_height;
+	float2 transmittanceData = UvToTransmittanceParameters(uv, innerRadius, outerRadius);
+
+	// float r = transmittance_data.x - atmosphere_data.sea_level + atmosphere_data.planet_radius;
+	// float r = max(transmittance_data.x, atmosphere_data.planet_radius + MIN_HEIGHT);
+	float r = transmittanceData.x;
+	float cosTheta = transmittanceData.y;
+	float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+	float3 viewPos = float3(0.0, r, 0.0);
+	float3 viewDir = float3(sinTheta, cosTheta, 0.0);
+
+	int2 clampedId = clamp(int2(id.xy), 0, int2(dimX - 1, dimY - 1));
+    float3 transmittance = TransmitToAtmosphere(atmosphereData, viewPos, viewDir);
+    _TransmittanceLUT[clampedId] = float4(transmittance, 1.0);
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, 1)]
+void ComputeMultiScattering(uint3 id : SV_DispatchThreadID)
+{
+	float dimX;
+	float dimY;
+	_MultiScatteringLUT.GetDimensions(dimX, dimY);
+	
+	AtmosphereData atmosphereData = GetAtmosphereData();
+	float2 uv = (float2(id.x, id.y) + 0.5) / float2(dimX, dimY);
+	
+	float cosTheta = uv.x * 2.0 - 1.0;
+	float r = uv.y * atmosphereData.atmosphere_height + atmosphereData.planet_radius;
+	float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+	float3 lightDir = float3(sinTheta, cosTheta, 0.0);
+	float3 position = float3(0.0, r, 0.0);
+
+	int2 clampedId = clamp(int2(id.xy), 0, int2(dimX - 1, dimY - 1));
+	float3 multiScattering = MultiScattering(atmosphereData, position, lightDir, _TransmittanceReadonlyLUT, linear_clamp_sampler);
+	_MultiScatteringLUT[clampedId] = float4(multiScattering, 1.0);
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, 1)]
+void ComputeSkyView(uint3 id : SV_DispatchThreadID)
+{
+	float dimX;
+	float dimY;
+	_SkyViewLUT.GetDimensions(dimX, dimY);
+	
+	AtmosphereData atmosphereData = GetAtmosphereData();
+	float2 uv = (float2(id.x, id.y) + 0.5) / float2(dimX, dimY);
+	float3 viewDir = CompressedUvToViewDirection(uv);
+	float3 lightDir = _MainLightPosition.xyz;
+	float cameraPos = max(_WorldSpaceCameraPos.y, MIN_HEIGHT);
+	float h = cameraPos - atmosphereData.sea_level + atmosphereData.planet_radius;
+	float3 viewPos = float3(0.0, h, 0.0);
+	float3 color = GetSkyColor(atmosphereData, viewPos, viewDir, lightDir, -1.0);
+	color = saturate(color);
+	
+	int2 clampedId = clamp(int2(id.xy), 0, int2(dimX - 1, dimY - 1));
+	_SkyViewLUT[clampedId] = float4(color, 1.0);
+}
