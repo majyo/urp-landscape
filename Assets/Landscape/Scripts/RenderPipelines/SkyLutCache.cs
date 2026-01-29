@@ -37,9 +37,23 @@ namespace Landscape.RenderPipelines
         private readonly Dictionary<int, CameraEntry> _perCamera = new();
         private int _lastCleanupFrame;
 
+        // Track the main camera's sky view for ambient probe updates
+        private int _mainCameraSkyViewKey;
+        private RTHandle _mainCameraSkyView;
+
         public void Dispose()
         {
             ReleaseAll();
+        }
+
+        /// <summary>
+        /// Get the main camera's SkyView LUT and key for ambient probe computation.
+        /// </summary>
+        public bool TryGetMainCameraSkyView(out RTHandle skyView, out int skyViewKey)
+        {
+            skyView = _mainCameraSkyView;
+            skyViewKey = _mainCameraSkyViewKey;
+            return skyView != null && skyView.rt != null;
         }
 
         internal void ReleaseAll()
@@ -197,6 +211,14 @@ namespace Landscape.RenderPipelines
 
             entry.lastUsedFrame = currentFrame;
             _perCamera[cameraId] = entry;
+
+            // Track main camera's sky view for ambient probe updates
+            // Use the first camera that requests a sky view as the main camera
+            if (_mainCameraSkyView == null || needsUpdate)
+            {
+                _mainCameraSkyView = entry.skyView;
+                _mainCameraSkyViewKey = skyViewKey;
+            }
 
             skyView = entry.skyView;
             MaybeCleanup(currentFrame);

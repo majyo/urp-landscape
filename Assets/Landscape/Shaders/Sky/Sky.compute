@@ -1,8 +1,10 @@
 #pragma kernel ComputeTransmittance
 #pragma kernel ComputeMultiScattering
 #pragma kernel ComputeSkyView
+#pragma kernel ComputeAmbientSH
 
 #define NUM_THREADS 8
+#define SH_SAMPLE_COUNT 64
 
 #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 #include "Assets/Landscape/ShaderLibrary/Sky/MathHelpers.hlsl"
@@ -14,8 +16,12 @@ RWTexture2D<float4> _SkyViewLUT;
 
 TEXTURE2D(_TransmittanceReadonlyLUT);
 TEXTURE2D(_MultiScatteringReadonlyLUT);
+TEXTURE2D(_SkyViewReadonlyLUT);
 
 SAMPLER(linear_clamp_sampler);
+
+// Ambient SH output buffer: 9 coefficients (L0-L2), each with RGB
+RWStructuredBuffer<float4> _AmbientSHCoefficients;
 
 float2 IdToUv(uint2 id, float2 dim)
 {
@@ -232,4 +238,90 @@ void ComputeSkyView(uint3 id : SV_DispatchThreadID)
 	
 	int2 clampedId = clamp(int2(id.xy), 0, int2(dimX - 1, dimY - 1));
 	_SkyViewLUT[clampedId] = float4(color, 1.0);
+}
+
+// ============================================================================
+// Ambient Spherical Harmonics Computation
+// ============================================================================
+
+// Shared memory for parallel reduction
+groupshared float3 gs_SHCoefficients[9][SH_SAMPLE_COUNT];
+
+// Compute SH basis functions for L0-L2 (9 coefficients)
+// Using real spherical harmonics with standard normalization
+void ComputeSHBasis(float3 dir, out float basis[9])
+{
+	// L0 band (1 coefficient)
+	basis[0] = 0.282095f; // Y_0^0 = 0.5 * sqrt(1/PI)
+	
+	// L1 band (3 coefficients)
+	basis[1] = 0.488603f * dir.y;  // Y_1^-1
+	basis[2] = 0.488603f * dir.z;  // Y_1^0
+	basis[3] = 0.488603f * dir.x;  // Y_1^1
+	
+	// L2 band (5 coefficients)
+	basis[4] = 1.092548f * dir.x * dir.y;                      // Y_2^-2
+	basis[5] = 1.092548f * dir.y * dir.z;                      // Y_2^-1
+	basis[6] = 0.315392f * (3.0f * dir.z * dir.z - 1.0f);      // Y_2^0
+	basis[7] = 1.092548f * dir.x * dir.z;                      // Y_2^1
+	basis[8] = 0.546274f * (dir.x * dir.x - dir.y * dir.y);    // Y_2^2
+}
+
+// Sample sky color from SkyView LUT given a world direction
+float3 SampleSkyColor(float3 direction)
+{
+	float2 uv = ViewDirectionToCompressedUv(direction);
+	return _SkyViewReadonlyLUT.SampleLevel(linear_clamp_sampler, uv, 0).rgb;
+}
+
+[numthreads(SH_SAMPLE_COUNT, 1, 1)]
+void ComputeAmbientSH(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+{
+	// Each thread samples one direction from the predefined sphere samples
+	float3 sampleDir = RANDOM_SPHERE_SAMPLES[groupIndex];
+	
+	// Sample sky color for this direction
+	float3 skyColor = SampleSkyColor(sampleDir);
+	
+	// Compute SH basis for this direction
+	float shBasis[9];
+	ComputeSHBasis(sampleDir, shBasis);
+	
+	// Weight for Monte Carlo integration: 4*PI / N (solid angle per sample)
+	float weight = 4.0f * PI / (float)SH_SAMPLE_COUNT;
+	
+	// Store weighted contribution to shared memory
+	[unroll]
+	for (int i = 0; i < 9; i++)
+	{
+		gs_SHCoefficients[i][groupIndex] = skyColor * shBasis[i] * weight;
+	}
+	
+	GroupMemoryBarrierWithGroupSync();
+	
+	// Parallel reduction to sum all contributions
+	// Only first 32 threads participate in reduction
+	[unroll]
+	for (uint stride = SH_SAMPLE_COUNT / 2; stride > 0; stride >>= 1)
+	{
+		if (groupIndex < stride)
+		{
+			[unroll]
+			for (int j = 0; j < 9; j++)
+			{
+				gs_SHCoefficients[j][groupIndex] += gs_SHCoefficients[j][groupIndex + stride];
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	
+	// Thread 0 writes final results to output buffer
+	if (groupIndex == 0)
+	{
+		[unroll]
+		for (int k = 0; k < 9; k++)
+		{
+			_AmbientSHCoefficients[k] = float4(gs_SHCoefficients[k][0], 1.0f);
+		}
+	}
 }

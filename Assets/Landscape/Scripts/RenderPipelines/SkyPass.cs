@@ -1,4 +1,4 @@
-﻿using Landscape.Sky;
+using Landscape.Sky;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.RenderGraphModule;
@@ -11,6 +11,7 @@ namespace Landscape.RenderPipelines
         public int transmittanceKernel;
         public int multiScatteringKernel;
         public int skyViewKernel;
+        public int ambientSHKernel;
 
         public uint threadGroupSizeX;
         public uint threadGroupSizeY;
@@ -56,6 +57,7 @@ namespace Landscape.RenderPipelines
         public SkyComputeShaderData SkyComputeShaderData { get; set; }
         public Material SkyboxMaterial { get; set; }
         public SkyLutCache LutCache { get; set; }
+        public SkyAmbientProbeUpdater AmbientProbeUpdater { get; set; }
 
         public SkyRenderer SkyRenderer
         {
@@ -279,6 +281,15 @@ namespace Landscape.RenderPipelines
             }
 
             UpdateSkyboxMaterial();
+
+            // Request ambient SH computation after sky view is updated
+            if (AmbientProbeUpdater != null && SkyRenderer.UpdateAmbientProbe)
+            {
+                if (LutCache.TryGetMainCameraSkyView(out var mainSkyView, out var mainSkyViewKey))
+                {
+                    AmbientProbeUpdater.RequestCompute(mainSkyView, mainSkyViewKey);
+                }
+            }
         }
 
         private void UpdateSkyboxMaterial()

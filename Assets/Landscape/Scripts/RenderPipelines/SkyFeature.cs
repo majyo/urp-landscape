@@ -1,3 +1,4 @@
+using Landscape.Sky;
 using UnityEngine;
 using UnityEngine.Rendering.Universal;
 
@@ -11,6 +12,7 @@ namespace Landscape.RenderPipelines
         private static int _transmittanceKernel;
         private static int _multiScatteringKernel;
         private static int _skyViewKernel;
+        private static int _ambientSHKernel;
 
         private static uint _threadGroupSizeX;
         private static uint _threadGroupSizeY;
@@ -18,6 +20,7 @@ namespace Landscape.RenderPipelines
         private SkyPass _atmospherePass;
         private SkyLutKeepAlivePass _lutKeepAlivePass;
         private SkyLutCache _lutCache;
+        private SkyAmbientProbeUpdater _ambientProbeUpdater;
 
         /// <inheritdoc/>
         public override void Create()
@@ -25,9 +28,17 @@ namespace Landscape.RenderPipelines
             _lutCache?.Dispose();
             _lutCache = new SkyLutCache();
 
+            _ambientProbeUpdater?.Dispose();
+            _ambientProbeUpdater = new SkyAmbientProbeUpdater();
+            _ambientProbeUpdater.Initialize(skyComputeShader);
+
+            // Set the static reference for SkyRenderer to access
+            SkyRenderer.SetAmbientProbeUpdater(_ambientProbeUpdater);
+
             _transmittanceKernel = skyComputeShader.FindKernel("ComputeTransmittance");
             _multiScatteringKernel = skyComputeShader.FindKernel("ComputeMultiScattering");
             _skyViewKernel = skyComputeShader.FindKernel("ComputeSkyView");
+            _ambientSHKernel = skyComputeShader.FindKernel("ComputeAmbientSH");
 
             skyComputeShader.GetKernelThreadGroupSizes(_transmittanceKernel, out _threadGroupSizeX,
                 out _threadGroupSizeY, out _);
@@ -37,12 +48,14 @@ namespace Landscape.RenderPipelines
                 renderPassEvent = RenderPassEvent.BeforeRenderingSkybox,
                 SkyboxMaterial = skyboxMaterial,
                 LutCache = _lutCache,
+                AmbientProbeUpdater = _ambientProbeUpdater,
                 SkyComputeShaderData = new SkyComputeShaderData
                 {
                     skyComputeShader = skyComputeShader,
                     transmittanceKernel = _transmittanceKernel,
                     multiScatteringKernel = _multiScatteringKernel,
                     skyViewKernel = _skyViewKernel,
+                    ambientSHKernel = _ambientSHKernel,
                     threadGroupSizeX = _threadGroupSizeX,
                     threadGroupSizeY = _threadGroupSizeY
                 }
@@ -66,6 +79,9 @@ namespace Landscape.RenderPipelines
         {
             _lutCache?.Dispose();
             _lutCache = null;
+            _ambientProbeUpdater?.Dispose();
+            _ambientProbeUpdater = null;
+            SkyRenderer.SetAmbientProbeUpdater(null);
             base.Dispose(disposing);
         }
     }
